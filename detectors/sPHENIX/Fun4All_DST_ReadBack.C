@@ -17,7 +17,7 @@
 
 R__LOAD_LIBRARY(libfun4all.so)
 
-void Fun4All_ReadBack(const int nevnt = 0, const char *inputfile = "G4sPHENIX.root")
+void Fun4All_DST_ReadBack(const int nevnt = 0, const char *inputfile = "G4sPHENIX.root")
 {
   gSystem->Load("libg4dst");
   Fun4AllServer *se = Fun4AllServer::instance();

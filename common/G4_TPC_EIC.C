@@ -1,14 +1,13 @@
 #ifndef MACRO_G4TPCEIC_C
 #define MACRO_G4TPCEIC_C
 
-#include "GlobalVariables.C"
+#include <GlobalVariables.C>
 
-#include "G4_Mvtx_EIC.C"
+#include <G4_Mvtx_EIC.C>
 
 #include <g4detectors/PHG4CylinderSubsystem.h>
 
 #include <g4tpc/PHG4TpcEndCapSubsystem.h>
-#include <g4tpc/PHG4TpcSpaceChargeDistortion.h>
 
 #include <g4main/PHG4Reco.h>
 

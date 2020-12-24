@@ -1,12 +1,13 @@
 #ifndef MACRO_G4TRACKING_C
 #define MACRO_G4TRACKING_C
 
-#include "GlobalVariables.C"
+#include <GlobalVariables.C>
+#include <QA.C>
 
-#include "G4_Intt.C"
-#include "G4_Micromegas.C"
-#include "G4_Mvtx.C"
-#include "G4_TPC.C"
+#include <G4_Intt.C>
+#include <G4_Micromegas.C>
+#include <G4_Mvtx.C>
+#include <G4_TPC.C>
 
 #include <fun4all/Fun4AllServer.h>
 
@@ -19,6 +20,7 @@
 #include <trackreco/PHHoughSeeding.h>
 #include <trackreco/PHInitZVertexing.h>
 #include <trackreco/PHMicromegasTpcTrackMatching.h>
+#include <trackreco/PHRaveVertexing.h>
 #include <trackreco/PHSiliconTpcTrackMatching.h>
 #include <trackreco/PHSiliconTruthTrackSeeding.h>
 #include <trackreco/PHTrackSeeding.h>
@@ -27,33 +29,46 @@
 #include <trackreco/PHTruthVertexing.h>
 
 #if __cplusplus >= 201703L
-#include <trackreco/MakeActsGeometry.h>
 #include <trackreco/ActsEvaluator.h>
+#include <trackreco/MakeActsGeometry.h>
 #include <trackreco/PHActsSourceLinks.h>
+#include <trackreco/PHActsSiliconSeeding.h>
 #include <trackreco/PHActsTracks.h>
 #include <trackreco/PHActsTrkFitter.h>
 #include <trackreco/PHActsTrkProp.h>
+#include <trackreco/PHActsInitialVertexFinder.h>
 #include <trackreco/PHActsVertexFinder.h>
 #include <trackreco/PHActsVertexFitter.h>
+#include <trackreco/PHTpcResiduals.h>
 #endif
 
 #include <trackbase/TrkrHitTruthAssoc.h>
 
 #include <phtpctracker/PHTpcTracker.h>
 
+#include <qa_modules/QAG4SimulationTracking.h>
+#include <qa_modules/QAG4SimulationUpsilon.h>
+#include <qa_modules/QAG4SimulationVertex.h>
+
 R__LOAD_LIBRARY(libg4eval.so)
 R__LOAD_LIBRARY(libtrack_reco.so)
 R__LOAD_LIBRARY(libPHTpcTracker.so)
+R__LOAD_LIBRARY(libqa_modules.so)
 
 namespace Enable
 {
   bool TRACKING_TRACK = false;
   bool TRACKING_EVAL = false;
   int TRACKING_VERBOSITY = 0;
+  bool TRACKING_QA = false;
 }  // namespace Enable
 
 namespace G4TRACKING
 {
+  // Space Charge calibration flag
+  bool SC_CALIBMODE = true;        // this is anded with G4TPC::ENABLE_DISTORTIONS in TrackingInit()
+  double SC_COLLISIONRATE = 50e3;  // leave at 50 KHz for now, scaling of distortion map not implemented yet
+
   // Tracking reconstruction setup parameters and flags
   //=====================================
 
@@ -67,15 +82,18 @@ namespace G4TRACKING
   //   PHActsTracks                                  // convert SvtxTracks to Acts tracks
   //   PHActsTrkFitter                               // Kalman fitter makes final fit to assembled tracks
 
+  bool g4eval_use_initial_vertex = true;  // if true, g4eval uses initial vertices in SvtxVertexMap, not final vertices in SvtxVertexMapRefit
+
   // Possible variations - these are normally false
   bool use_PHTpcTracker_seeding = false;   // false for using the default PHCASeeding to get TPC track seeds, true to use PHTpcTracker
   bool use_truth_si_matching = false;      // if true, associates silicon clusters using best truth track match to TPC seed tracks - for diagnostics only
   bool use_truth_track_seeding = false;    // false for normal track seeding, use true to run with truth track seeding instead  ***** WORKS FOR GENFIT ONLY
   bool use_Genfit = false;                 // if false, acts KF is run on proto tracks assembled above, if true, use Genfit track propagation and fitting
-  bool use_init_vertexing = false;         // false for using smeared truth vertex, set to true to get initial vertex from MVTX hits using PHInitZVertexing
-  bool g4eval_use_initial_vertex = false;  // if true, g4eval uses initial vertices in SvtxVertexMap, not final vertices in SvtxVertexMapRefit
+  bool use_acts_init_vertexing = false;    // if true runs acts silicon seeding+initial vertexing 
+  bool use_phinit_vertexing = false && !use_acts_init_vertexing;         // false for using smeared truth vertex, set to true to get initial vertex from MVTX hits using PHInitZVertexing
+  bool use_rave_vertexing = true;          // Use Rave to find and fit for vertex after track fitting
   bool use_primary_vertex = false;         // refit Genfit tracks (only) with primary vertex included - adds second node to node tree, adds second evaluator, outputs separate ntuples
-
+  bool use_acts_evaluator = false;         // Turn to true for an acts evaluator which outputs acts specific information in a tuple
   int init_vertexing_min_zvtx_tracks = 2;  // PHInitZvertexing parameter for reducing spurious vertices, use 2 for Pythia8 events, 5 for large multiplicity events
                                            //default seed is PHTpcTracker
 
@@ -121,6 +139,20 @@ void TrackingInit()
   {
     G4MICROMEGAS::n_micromegas_layer = 0;
   }
+
+  // SC_CALIBMODE makes no sense if distortions are not present
+  G4TRACKING::SC_CALIBMODE = (G4TPC::ENABLE_STATIC_DISTORTIONS || G4TPC::ENABLE_TIME_ORDERED_DISTORTIONS ) && G4TRACKING::SC_CALIBMODE;
+
+  // Genfit does final vertexing, Acts does not
+  if (G4TRACKING::use_Genfit)
+    G4TRACKING::g4eval_use_initial_vertex = false;
+
+  // For now the TpcSpaceChargeCorrection module only works with the GenFit tracking chain
+  if (G4TPC::ENABLE_CORRECTIONS && !G4TRACKING::use_Genfit)
+  {
+    std::cout << "Cannot enable space charge correction if not using GenFit tracking chain" << std::endl;
+    G4TPC::ENABLE_CORRECTIONS = false;
+  }
 }
 
 void Tracking_Reco()
@@ -138,16 +170,41 @@ void Tracking_Reco()
   // Tracking
   //------------
 
-  // Initial vertex finding (independent of tracking)
+  if(!G4TRACKING::use_Genfit)
+    {
+#if __cplusplus >= 201703L
+      /// Geometry must be built before any Acts modules
+      MakeActsGeometry* geom = new MakeActsGeometry();
+      geom->Verbosity(verbosity);
+      geom->setMagField(G4MAGNET::magfield);
+      geom->setMagFieldRescale(G4MAGNET::magfield_rescale);
+      se->registerSubsystem(geom);
+      
+      /// Always run PHActsSourceLinks first, to convert TrkrClusters 
+      /// to the Acts equivalent
+      PHActsSourceLinks* sl = new PHActsSourceLinks();
+      sl->Verbosity(verbosity);
+      sl->setMagField(G4MAGNET::magfield);
+      sl->setMagFieldRescale(G4MAGNET::magfield_rescale);
+      se->registerSubsystem(sl);
+#endif  
+    }
+
+  // Initial vertex finding
   //=================================
-  if (!G4TRACKING::use_init_vertexing)
-  {
-    // We cheat to get the initial vertex for the full track reconstruction case
-    PHInitVertexing* init_vtx = new PHTruthVertexing("PHTruthVertexing");
-    init_vtx->Verbosity(verbosity);
-    se->registerSubsystem(init_vtx);
-  }
-  else
+  if(G4TRACKING::use_acts_init_vertexing && !G4TRACKING::use_Genfit)
+    {
+      #if __cplusplus >= 201703L
+      PHActsSiliconSeeding* silicon_Seeding = new PHActsSiliconSeeding();
+      silicon_Seeding->Verbosity(verbosity);
+      se->registerSubsystem(silicon_Seeding);
+
+      PHActsInitialVertexFinder *initFinder = new PHActsInitialVertexFinder();
+      initFinder->Verbosity(verbosity);
+      se->registerSubsystem(initFinder);
+      #endif
+    }
+  else if (G4TRACKING::use_phinit_vertexing)
   {
     // get the initial vertex for track fitting from the MVTX hits
     PHInitZVertexing* init_zvtx = new PHInitZVertexing(7, 7, "PHInitZVertexing");
@@ -158,6 +215,15 @@ void Tracking_Reco()
     init_zvtx->set_min_zvtx_tracks(G4TRACKING::init_vertexing_min_zvtx_tracks);
     init_zvtx->Verbosity(verbosity);
     se->registerSubsystem(init_zvtx);
+  }
+  else
+  {
+    // We cheat to get the initial vertex for the full track reconstruction case
+    std::cout << "JOE TRUTH VERTEXING"<<std::endl;
+    PHInitVertexing* init_vtx = new PHTruthVertexing("PHTruthVertexing");
+    init_vtx->Verbosity(verbosity);
+    se->registerSubsystem(init_vtx);
+
   }
 
   // Truth track seeding and propagation in one module
@@ -248,13 +314,6 @@ void Tracking_Reco()
     kalman->set_use_truth_vertex(false);
 
     se->registerSubsystem(kalman);
-
-    //------------------
-    // Track Projections
-    //------------------
-    PHGenFitTrackProjection* projection = new PHGenFitTrackProjection();
-    projection->Verbosity(verbosity);
-    se->registerSubsystem(projection);
   }
 
   // Acts tracking chain (starts from TPC track seeds)
@@ -270,7 +329,7 @@ void Tracking_Reco()
       // use truth particle matching in TPC to assign clusters in silicon to TPC tracks from CA seeder
       // intended only for diagnostics
       PHTruthSiliconAssociation* silicon_assoc = new PHTruthSiliconAssociation();
-      silicon_assoc->Verbosity(0);
+      silicon_assoc->Verbosity(verbosity);
       se->registerSubsystem(silicon_assoc);
     }
     else
@@ -281,19 +340,37 @@ void Tracking_Reco()
       // start with a complete TPC track seed from one of the CA seeders
 
       // use truth information to assemble silicon clusters into track stubs for now
-      PHSiliconTruthTrackSeeding* silicon_seeding = new PHSiliconTruthTrackSeeding();
-      silicon_seeding->Verbosity(0);
-      se->registerSubsystem(silicon_seeding);
+      if(!G4TRACKING::use_acts_init_vertexing)
+	{
+	  PHSiliconTruthTrackSeeding* silicon_seeding = new PHSiliconTruthTrackSeeding();
+	  silicon_seeding->Verbosity(0);
+	  se->registerSubsystem(silicon_seeding);
+	  std::cout << "JOE SILICON TRUTH TRACK SEEDING"<<std::endl;
+	}
 
-      // Match the TPC track stubs from Cthe A seeder to silicon track stubs from PHSiliconTruthTrackSeeding
+      // Match the TPC track stubs from the CA seeder to silicon track stubs from PHSiliconTruthTrackSeeding
       PHSiliconTpcTrackMatching* silicon_match = new PHSiliconTpcTrackMatching();
       silicon_match->Verbosity(0);
       if (!G4TRACKING::use_PHTpcTracker_seeding)
-        silicon_match->set_seeder(true);  // defaults to PHTpcTracker seeding, use true for PHCASeeding
+        silicon_match->set_seeder(true);  // module defaults to PHCASeeding, use true for PHTpcTracker seeding
       silicon_match->set_field(G4MAGNET::magfield);
       silicon_match->set_field_dir(G4MAGNET::magfield_rescale);
-      silicon_match->set_phi_search_window(0.02);   // tune8 - optimum
-      silicon_match->set_eta_search_window(0.015);  // tune8 - optimum
+      silicon_match->set_sc_calib_mode(G4TRACKING::SC_CALIBMODE);
+      if (G4TRACKING::SC_CALIBMODE)
+      {
+        silicon_match->set_collision_rate(G4TRACKING::SC_COLLISIONRATE);
+        // search windows for initial matching with distortions
+        // tuned values are 0.04 and 0.008 in distorted events
+        silicon_match->set_phi_search_window(0.04);
+        silicon_match->set_eta_search_window(0.008);
+      }
+      else
+      {
+        // after distortion corrections and rerunning clustering, default tuned values are 0.02 and 0.004 in low occupancy events
+        silicon_match->set_phi_search_window(0.02);
+        silicon_match->set_eta_search_window(0.004);
+      }
+      silicon_match->set_test_windows_printout(false);  // used for tuning search windows only
       se->registerSubsystem(silicon_match);
     }
 
@@ -305,13 +382,27 @@ void Tracking_Reco()
       // Match TPC track stubs from CA seeder to clusters in the micromegas layers
       PHMicromegasTpcTrackMatching* mm_match = new PHMicromegasTpcTrackMatching();
       mm_match->Verbosity(0);
-      // baseline configuration is (0.2, 13.0, 26, 0.2) and is the default
-      mm_match->set_rphi_search_window_lyr1(0.2);
-      mm_match->set_rphi_search_window_lyr2(13.0);
-      mm_match->set_z_search_window_lyr1(26.0);
-      mm_match->set_z_search_window_lyr2(0.2);
-      mm_match->set_min_tpc_layer(38);           // layer in TPC to start projection fit
-      mm_match->print_test_windows_data(false);  // normally false
+      mm_match->set_sc_calib_mode(G4TRACKING::SC_CALIBMODE);
+      if (G4TRACKING::SC_CALIBMODE)
+      {
+        // calibration pass with distorted tracks
+        mm_match->set_collision_rate(G4TRACKING::SC_COLLISIONRATE);
+        // configuration is potentially with different search windows
+        mm_match->set_rphi_search_window_lyr1(0.2);
+        mm_match->set_rphi_search_window_lyr2(13.0);
+        mm_match->set_z_search_window_lyr1(26.0);
+        mm_match->set_z_search_window_lyr2(0.2);
+      }
+      else
+      {
+        // baseline configuration is (0.2, 13.0, 26, 0.2) and is the default
+        mm_match->set_rphi_search_window_lyr1(0.2);
+        mm_match->set_rphi_search_window_lyr2(13.0);
+        mm_match->set_z_search_window_lyr1(26.0);
+        mm_match->set_z_search_window_lyr2(0.2);
+      }
+      mm_match->set_min_tpc_layer(38);             // layer in TPC to start projection fit
+      mm_match->set_test_windows_printout(false);  // used for tuning search windows only
       se->registerSubsystem(mm_match);
     }
   }
@@ -323,32 +414,52 @@ void Tracking_Reco()
     std::cout << "   Using Acts track fitting " << std::endl;
 
 #if __cplusplus >= 201703L
-    /// Geometry must be built before any Acts modules
-    MakeActsGeometry *geom = new MakeActsGeometry();
-    geom->Verbosity(0);
-    geom->setMagField(G4MAGNET::magfield);
-    geom->setMagFieldRescale(G4MAGNET::magfield_rescale);
-    se->registerSubsystem(geom);
-    
-    /// Always run PHActsSourceLinks and PHActsTracks first, to convert TrkRClusters and SvtxTracks to the Acts equivalent
-    PHActsSourceLinks *sl = new PHActsSourceLinks();
-    sl->Verbosity(0);
-    sl->setMagField(G4MAGNET::magfield);
-    sl->setMagFieldRescale(G4MAGNET::magfield_rescale);
-    se->registerSubsystem(sl);
-    
-    PHActsTracks *actsTracks = new PHActsTracks();
-    actsTracks->Verbosity(0);
+  
+
+    PHActsTracks* actsTracks = new PHActsTracks();
+    actsTracks->Verbosity(verbosity);
     se->registerSubsystem(actsTracks);
-    
-    PHActsTrkFitter *actsFit = new PHActsTrkFitter();
-    actsFit->Verbosity(0);
+
+    PHActsTrkFitter* actsFit = new PHActsTrkFitter();
+    actsFit->Verbosity(verbosity);
     actsFit->doTimeAnalysis(false);
+    /// If running with distortions, fit only the silicon+MMs first
+    actsFit->fitSiliconMMs(G4TRACKING::SC_CALIBMODE);
     se->registerSubsystem(actsFit);
-      
-#endif   
-    
+
+    if (G4TRACKING::SC_CALIBMODE)
+    {
+      /// run tpc residual determination with silicon+MM track fit
+      PHTpcResiduals* residuals = new PHTpcResiduals();
+      residuals->Verbosity(verbosity);
+      se->registerSubsystem(residuals);
+    }
+
+    PHActsVertexFinder* vtxer = new PHActsVertexFinder();
+    vtxer->Verbosity(verbosity);
+    se->registerSubsystem(vtxer);
+
+#endif
   }
+
+  // Final vertex finding and fitting with RAVE
+  //=================================
+  if (G4TRACKING::use_rave_vertexing)
+  {
+    PHRaveVertexing* rave = new PHRaveVertexing();
+    //    rave->set_vertexing_method("kalman-smoothing:1");
+    rave->set_over_write_svtxvertexmap(false);
+    rave->set_svtxvertexmaprefit_node_name("SvtxVertexMapRave");
+    rave->Verbosity(verbosity);
+    se->registerSubsystem(rave);
+  }
+
+  //------------------
+  // Track Projections
+  //------------------
+  PHGenFitTrackProjection* projection = new PHGenFitTrackProjection();
+  projection->Verbosity(verbosity);
+  se->registerSubsystem(projection);
 
   return;
 }
@@ -382,13 +493,16 @@ void Tracking_Eval(const std::string& outputfile)
   eval->Verbosity(verbosity);
   se->registerSubsystem(eval);
 
-  if (!G4TRACKING::use_Genfit)
+  if (!G4TRACKING::use_Genfit && !G4TRACKING::SC_CALIBMODE)
   {
 #if __cplusplus >= 201703L
-    ActsEvaluator* actsEval = new ActsEvaluator(outputfile + "_acts.root", eval);
-    actsEval->Verbosity(0);
-    actsEval->setEvalCKF(false);
-    se->registerSubsystem(actsEval);
+    if (G4TRACKING::use_acts_evaluator)
+    {
+      ActsEvaluator* actsEval = new ActsEvaluator(outputfile + "_acts.root", eval);
+      actsEval->Verbosity(0);
+      actsEval->setEvalCKF(false);
+      se->registerSubsystem(actsEval);
+    }
 #endif
   }
 
@@ -409,4 +523,64 @@ void Tracking_Eval(const std::string& outputfile)
 
   return;
 }
+
+void Tracking_QA()
+{
+  int verbosity = std::max(Enable::QA_VERBOSITY, Enable::TRACKING_VERBOSITY);
+
+  //---------------
+  // Fun4All server
+  //---------------
+
+  Fun4AllServer* se = Fun4AllServer::instance();
+
+  QAG4SimulationTracking* qa = new QAG4SimulationTracking();
+  //  qa->addEmbeddingID(2);
+  qa->Verbosity(verbosity);
+  se->registerSubsystem(qa);
+
+  QAG4SimulationVertex* qa2 = new QAG4SimulationVertex();
+  // qa2->addEmbeddingID(2);
+  qa2->Verbosity(verbosity);
+  se->registerSubsystem(qa2);
+
+  if (G4TRACKING::use_rave_vertexing)
+  {
+    QAG4SimulationVertex* qav = new QAG4SimulationVertex();
+    // qav->addEmbeddingID(2);
+    qav->Verbosity(verbosity);
+    qav->setVertexMapName("SvtxVertexMapRave");
+    se->registerSubsystem(qav);
+  }
+
+  //  Acts Kalman Filter vertex finder
+  //=================================
+  if (!G4TRACKING::use_Genfit)
+  {
+#if __cplusplus >= 201703L
+
+    //    PHActsVertexFinder* vtxer = new PHActsVertexFinder();
+    //    vtxer->Verbosity(verbosity);
+    //    se->registerSubsystem(vtxer);
+
+    QAG4SimulationVertex* qav = new QAG4SimulationVertex();
+    // qav->addEmbeddingID(2);
+    qav->Verbosity(verbosity);
+    qav->setVertexMapName("SvtxVertexMapActs");
+    se->registerSubsystem(qav);
+#endif
+  }
+
+  if (Input::UPSILON)
+  {
+    QAG4SimulationUpsilon* qa = new QAG4SimulationUpsilon();
+
+    for (int id : Input::UPSILON_EmbedIds)
+    {
+      qa->addEmbeddingID(id);
+    }
+    se->registerSubsystem(qa);
+  }
+}
+
 #endif

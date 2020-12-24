@@ -1,12 +1,14 @@
 #ifndef MACRO_G4TPC_C
 #define MACRO_G4TPC_C
 
-#include "GlobalVariables.C"
+#include <GlobalVariables.C>
+#include <QA.C>
 
-#include "G4_Intt.C"
-#include "G4_Mvtx.C"
+#include <G4_Intt.C>
+#include <G4_Mvtx.C>
 
 #include <g4tpc/PHG4TpcDigitizer.h>
+#include <g4tpc/PHG4TpcDistortion.h>
 #include <g4tpc/PHG4TpcElectronDrift.h>
 #include <g4tpc/PHG4TpcEndCapSubsystem.h>
 #include <g4tpc/PHG4TpcPadPlane.h>
@@ -16,11 +18,14 @@
 #include <g4main/PHG4Reco.h>
 
 #include <tpc/TpcClusterizer.h>
+#include <tpc/TpcSpaceChargeCorrection.h>
+#include <qa_modules/QAG4SimulationTpc.h>
 
 #include <fun4all/Fun4AllServer.h>
 
 R__LOAD_LIBRARY(libg4tpc.so)
 R__LOAD_LIBRARY(libtpc.so)
+R__LOAD_LIBRARY(libqa_modules.so)
 
 namespace Enable
 {
@@ -29,6 +34,7 @@ namespace Enable
   bool TPC_OVERLAPCHECK = false;
   bool TPC_CELL = false;
   bool TPC_CLUSTER = false;
+  bool TPC_QA = false;
 
   bool TPC_ENDCAP = true;
 
@@ -43,6 +49,27 @@ namespace G4TPC
   int n_tpc_layer_outer = 16;
   int n_gas_layer = n_tpc_layer_inner + n_tpc_layer_mid + n_tpc_layer_outer;
   double tpc_outer_radius = 77. + 2.;
+
+  // distortions
+  bool ENABLE_STATIC_DISTORTIONS = false;
+  auto static_distortion_filename = std::string(getenv("CALIBRATIONROOT")) + "/TPC/DistortionMaps/fluct_average.rev3.1side.3d.file0.h_negz.real_B1.4_E-400.0.ross_phi1_sphenix_phislice_lookup_r26xp40xz40.distortion_map.hist.root";
+
+  bool ENABLE_TIME_ORDERED_DISTORTIONS = false;
+  std::string time_ordered_distortion_filename = "/gpfs/mnt/gpfs02/sphenix/user/klest/TimeOrderedDistortions.root";
+
+//   unsigned int distortion_coordinates =
+//     PHG4TpcElectronDrift::COORD_PHI|
+//     PHG4TpcElectronDrift::COORD_R|
+//     PHG4TpcElectronDrift::COORD_Z;
+
+  // distortion corrections
+  bool ENABLE_CORRECTIONS = false;
+  auto correction_filename = std::string(getenv("CALIBRATIONROOT")) + "/TPC/DistortionMaps/fluct_average.rev3.1side.3d.file0.h_negz.real_B1.4_E-400.0.ross_phi1_sphenix_phislice_lookup_r26xp40xz40.distortion_map.hist.root";
+  unsigned int correction_coordinates =
+    TpcSpaceChargeCorrection::COORD_PHI|
+    TpcSpaceChargeCorrection::COORD_R|
+    TpcSpaceChargeCorrection::COORD_Z;
+
 }  // namespace G4TPC
 
 void TPCInit()
@@ -102,24 +129,24 @@ double TPC(PHG4Reco* g4Reco,
   tpc->SetActive();
   tpc->SuperDetector("TPC");
   tpc->set_double_param("steplimits", 1);  // 1cm steps
-
+  
   if (AbsorberActive)
-  {
-    tpc->SetAbsorberActive();
-  }
+    {
+      tpc->SetAbsorberActive();
+    }
   tpc->OverlapCheck(OverlapCheck);
-
+  
   g4Reco->registerSubsystem(tpc);
-
+  
   if (Enable::TPC_ENDCAP)
-  {
-    TPC_Endcaps(g4Reco);
-  }
-
+    {
+      TPC_Endcaps(g4Reco);
+    }
+  
   radius = G4TPC::tpc_outer_radius;
-
+  
   radius += no_overlapp;
-
+  
   return radius;
 }
 
@@ -140,11 +167,22 @@ void TPC_Cells()
   PHG4TpcElectronDrift* edrift = new PHG4TpcElectronDrift();
   edrift->Detector("TPC");
   edrift->Verbosity(verbosity);
+  if( G4TPC::ENABLE_STATIC_DISTORTIONS || G4TPC::ENABLE_TIME_ORDERED_DISTORTIONS )
+  {
+    auto distortionMap = new PHG4TpcDistortion;
+    distortionMap->set_do_static_distortions( G4TPC::ENABLE_STATIC_DISTORTIONS );
+    distortionMap->set_static_distortion_filename( G4TPC::static_distortion_filename );
+
+    distortionMap->set_do_time_ordered_distortions( G4TPC::ENABLE_TIME_ORDERED_DISTORTIONS );
+    distortionMap->set_time_ordered_distortion_filename( G4TPC::time_ordered_distortion_filename );
+
+    distortionMap->Init();
+    edrift->setTpcDistortion( distortionMap );
+  }
+
   // fudge factors to get drphi 150 microns (in mid and outer Tpc) and dz 500 microns cluster resolution
   // They represent effects not due to ideal gas properties and ideal readout plane behavior
   // defaults are 0.085 and 0.105, they can be changed here to get a different resolution
-  //edrift->set_double_param("added_smear_trans",0.085);
-  //edrift->set_double_param("added_smear_long",0.105);
   edrift->registerPadPlane(padplane);
   se->registerSubsystem(edrift);
 
@@ -181,8 +219,31 @@ void TPC_Clustering()
 
   // For the Tpc
   //==========
-  TpcClusterizer* tpcclusterizer = new TpcClusterizer();
+  auto tpcclusterizer = new TpcClusterizer;
   tpcclusterizer->Verbosity(verbosity);
   se->registerSubsystem(tpcclusterizer);
+
+  // space charge correction
+  if( G4TPC::ENABLE_CORRECTIONS )
+  {
+    auto tpcSpaceChargeCorrection = new TpcSpaceChargeCorrection;
+    tpcSpaceChargeCorrection->set_distortion_filename( G4TPC::correction_filename );
+    tpcSpaceChargeCorrection->set_coordinates( G4TPC::correction_coordinates );
+    se->registerSubsystem(tpcSpaceChargeCorrection);
+  }
+
 }
+
+
+void TPC_QA()
+{
+  int verbosity = std::max(Enable::QA_VERBOSITY, Enable::TPC_VERBOSITY);
+
+  Fun4AllServer* se = Fun4AllServer::instance();
+  QAG4SimulationTpc * qa =  new QAG4SimulationTpc;
+  qa->Verbosity(verbosity);
+  se->registerSubsystem(qa);
+}
+
+
 #endif

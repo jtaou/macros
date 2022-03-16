@@ -370,11 +370,22 @@ void CEMC_Towers()
                                                         //  TowerDigitizer->set_zero_suppression_ADC(16);  // eRD1 test beam setting
   TowerDigitizer->GetParameters().ReadFromFile("CEMC", "xml", 0, 0,
                                                string(getenv("CALIBRATIONROOT")) + string("/CEMC/TowerCalibCombinedParams_2020/"));  // calibration database
+
+
+  TowerDigitizer->set_UseConditionsDB(false);
+  TowerDigitizer->set_DoTowerDecal(true,"emcal_corr1_29.root",true);
+  //  TowerDigitizer->set_DoTowerDecal(false);
+
   se->registerSubsystem(TowerDigitizer);
+  
 
   RawTowerCalibration *TowerCalibration = new RawTowerCalibration("EmcRawTowerCalibration");
   TowerCalibration->Detector("CEMC");
   TowerCalibration->Verbosity(verbosity);
+  
+  bool doSimple = true;
+
+
 
   if (G4CEMC::Cemc_spacal_configuration == PHG4CylinderGeom_Spacalv1::k1DProjectiveSpacal)
   {
@@ -399,6 +410,12 @@ void CEMC_Towers()
     }
     else
     {
+      
+      if (!doSimple) 
+	{
+
+
+      //for tower by tower cal
       TowerCalibration->set_calib_algorithm(RawTowerCalibration::kTower_by_tower_calibration);
       TowerCalibration->GetCalibrationParameters().ReadFromFile("CEMC", "xml", 0, 0,
 								string(getenv("CALIBRATIONROOT")) + string("/CEMC/TowerCalibCombinedParams_2020/"));  // calibration database
@@ -406,6 +423,23 @@ void CEMC_Towers()
       //    TowerCalibration->set_calib_const_GeV_ADC(1. / photoelectron_per_GeV / 0.9715);                                                             // overall energy scale based on 4-GeV photon simulations
       TowerCalibration->set_variable_pedestal(true);                                                                                                  //read pedestals from calibrations file comment next line if true
       //    TowerCalibration->set_pedstal_ADC(0);
+      ///////////////////////////
+
+	}
+      else // dosimple
+	{
+
+	  //          TowerCalibration->set_calib_algorithm(RawTowerCalibration::kSimple_linear_calibration);
+	  TowerCalibration->set_calib_algorithm(RawTowerCalibration::kDbfile_tbt_gain_corr);
+	  TowerCalibration->set_UseConditionsDB(false);
+	  //	  TowerCalibration->set_CalibrationFileName("emcal_corr1_29.root");
+	  TowerCalibration->set_CalibrationFileName("emcal_corr1_29.root");
+          TowerCalibration->set_calib_const_GeV_ADC(1. / photoelectron_per_GeV / 0.9715);                                                             // overall energy scale based on 4-GeV photon simulations
+	  //TowerCalibration->set_variable_pedestal(true);                                                                                                  //read pedestals from calibrations file comment next line if true
+	  TowerCalibration->set_pedstal_ADC(0);
+	  ///////////////////////////
+	}
+      
     }
   }
   else
